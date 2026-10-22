@@ -1,0 +1,166 @@
+La recette compute_CRF_ARCHIVES échoue en écrivant CRF_EXCH_RATES, alors que la table source se lit sans erreur dans Hue.
+La recette lit une liste de tables Hive (SELECT * FROM <table>) et écrit chacune dans un dataset DSS. La table en cause est uz_uc_rds_prod.rds_data_transfer_prod_raw_crf_exchange_rate_parquet (taux de change, partitionnée par dt_closing).
+Lire le log : aller à la ligne Caused by
+Le message affiché dans DSS (Py4JJavaError) n'est qu'une enveloppe. La vraie cause est dans le log complet du job, sur les lignes Caused by :
+Caused by: org.apache.spark.sql.execution.datasources.SchemaColumnConvertNotSupportedException:
+  column: [d_ex_date], physicalType: INT96, logicalType: string
+...
+Parquet column cannot be converted in file
+  hdfs://.../crf_exchange_rate/dt_closing=2024w1005/000000_0.
+  Column: [d_ex_date], Expected: string, Found: INT96
+Trois informations suffisent pour orienter le diagnostic :
+• La colonne : d_ex_date.
+• Ce que Spark attendait (Expected: string) et ce qu'il a trouvé (Found: INT96).
+• Le fichier : la partition dt_closing=2024w1005.
+L'erreur apparaît à l'écriture (ORCWriter) car c'est la première action qui lit réellement les données. Le spark.sql(...) et le filter qui précèdent ne sont pas en cause : Spark est paresseux et n'exécute rien avant une action.
+2. Concepts : deux schémas pour une même table
+Une table Hive sur Parquet a deux schémas : celui du métastore et celui écrit dans chaque fichier. Rien ne garantit qu'ils soient identiques.
+• Le métastore Hive décrit la table : noms et types des colonnes, partitions, emplacement HDFS. C'est ce qu'affichent Hue, DESCRIBE et spark.table().
+• Chaque fichier Parquet porte son propre schéma dans son pied de page (footer), fixé au moment de l'écriture. Une partition écrite en 2023 garde le schéma de 2023, même si la table change ensuite.
+Modifier le type d'une colonne dans le métastore (ALTER TABLE … CHANGE COLUMN) ne réécrit aucun fichier : les anciennes partitions gardent l'ancien type.
+Type physique et type logique
+Parquet stocke chaque colonne avec un type physique (la représentation en octets), complété parfois par un type logique (le sens de ces octets).
+Ce que l'on veut stocker
+Type physique Parquet
+Vu par Spark
+Texte "20100118"
+binary (STRING)
+string
+Date-heure (ancien format Hive/Impala)
+int96
+timestamp
+Date-heure (format actuel)
+int64 (TIMESTAMP)
+timestamp
+Nombre décimal
+double ou fixed_len_byte_array (DECIMAL)
+double / decimal
+INT96 est un format historique de timestamp sur 12 octets, écrit par défaut par d'anciennes versions de Hive et d'Impala. Il n'a pas de type logique : seul le lecteur sait qu'il s'agit d'une date-heure.
+3. Pourquoi Hive lit et Spark échoue
+Hive convertit silencieusement le timestamp en texte ; Spark refuse la conversion et s'arrête. Aucun des deux n'a « raison » : la donnée est incohérente.
+
+Hive (Hue)
+Spark (recette DSS)
+Lecteur Parquet
+SerDe Hive, ligne par ligne
+Lecteur natif vectorisé, par lots de colonnes
+INT96 lu avec un schéma string
+Converti en texte
+Refusé : SchemaColumnConvertNotSupportedException
+Résultat
+2010-01-18 00:00:00
+Échec du job
+La démonstration dans Hue
+La même colonne, lue dans deux partitions, ne renvoie pas le même format :
+SELECT d_ex_date
+FROM uz_uc_rds_prod.rds_data_transfer_prod_raw_crf_exchange_rate_parquet
+WHERE dt_closing = '2024w1005' LIMIT 5;
+-- 2010-01-18 00:00:00   (fichier en INT96, converti par Hive)
+
+SELECT d_ex_date
+FROM uz_uc_rds_prod.rds_data_transfer_prod_raw_crf_exchange_rate_parquet
+WHERE dt_closing = '2025w0405' LIMIT 5;
+-- 20100118              (fichier en string)
+Le log Hive affiche pourtant type:string dans les deux cas : c'est le type du métastore, pas celui du fichier.
+Le vrai risque : une erreur silencieuse
+L'échec de Spark est le cas favorable : il signale le problème. Avec un lecteur tolérant, la table mélange deux formats de date. Une jointure ou un filtre d_ex_date = '20241005' ignore alors sans erreur toutes les lignes au format 2024-10-05 00:00:00.
+4. Méthode de diagnostic pas à pas
+Quatre étapes, toutes exécutables dans un notebook PySpark DSS : comparer le métastore aux fichiers, partition par partition, jusqu'à dater la rupture.
+Étape 1 – Lire le schéma du métastore
+TABLE = "uz_uc_rds_prod.rds_data_transfer_prod_raw_crf_exchange_rate_parquet"
+spark_sess.table(TABLE).printSchema()
+# d_ex_date: string   <- ce que la table annonce
+Étape 2 – Lire le schéma réel d'une partition
+spark.read.parquet lit le footer des fichiers et ignore le métastore.
+base = "/Projects/UC_RDS/UC_RDS_PROD/uz_UC_RDS_PROD.db/data_collection/crf/crf_exchange_rate"
+for p in ["dt_closing=2024w1005", "dt_closing=2025w0405"]:
+    print(p, dict(spark_sess.read.parquet(f"{base}/{p}").dtypes)["d_ex_date"])
+# dt_closing=2024w1005 timestamp   <- INT96 dans le fichier
+# dt_closing=2025w0405 string
+Le chemin HDFS de la table s'obtient avec DESCRIBE FORMATTED <table> (ligne Location).
+Étape 3 – Balayer toutes les partitions
+Une partition en erreur en cache souvent d'autres. On ne lit que les footers, donc le balayage reste rapide.
+parts = [r[0] for r in spark_sess.sql(f"SHOW PARTITIONS {TABLE}").collect()]
+bad = []
+for p in parts:
+    t = dict(spark_sess.read.parquet(f"{base}/{p}").dtypes).get("d_ex_date")
+    if t != "string":
+        bad.append((p, t))
+print(f"{len(bad)}/{len(parts)} partitions:", bad)
+# 17/31 partitions: [...]
+Étape 4 – Trier dans le temps pour dater la rupture
+for p in sorted(parts):
+    print(p, dict(spark_sess.read.parquet(f"{base}/{p}").dtypes).get("d_ex_date"))
+L'ordre chronologique distingue deux causes qui appellent des actions différentes :
+• Une rupture nette (tout en timestamp, puis tout en string) : changement de type dans le chargement, partitions anciennes jamais réécrites.
+• Des types qui alternent : chargement instable ou rechargement avec une ancienne version du traitement.
+Sur notre table, on observe les deux : rupture en 2024w0803, puis une exception en 2024w1005 (frise ci-dessous).
+Une case par partition, dans l'ordre chronologique (espacement non proportionnel au temps).
+Option – Voir le type physique exact
+Pour prouver la présence d'INT96 au propriétaire de la table, on lit le footer du fichier :
+jvm = spark_sess._jvm
+conf = spark_sess._jsc.hadoopConfiguration()
+path = jvm.org.apache.hadoop.fs.Path(f"{base}/dt_closing=2024w1005/000000_0")
+footer = jvm.org.apache.parquet.hadoop.ParquetFileReader.readFooter(conf, path)
+print(footer.getFileMetaData().getSchema().toString())
+# optional int96 d_ex_date;
+5. Correctifs
+Le contournement dans la recette débloque le traitement tout de suite ; seul le rechargement des partitions à la source corrige la table pour tous ses lecteurs.
+Côté recette (appliqué et validé)
+1. Lire la table avec le lecteur Hive, qui tolère la conversion INT96 → string, au lieu du lecteur natif de Spark.
+2. Ramener d_ex_date à un format unique yyyyMMdd.
+spark_sess.conf.set("spark.sql.hive.convertMetastoreParquet", "false")
+
+df = spark_sess.sql(sql)
+if meta["name"] == "CRF_EXCH_RATES":
+    # "2010-01-18 00:00:00" -> "20100118" ; "20100118" reste inchangé
+    df = df.withColumn("d_ex_date",
+                       F.regexp_replace(F.substring("d_ex_date", 1, 10), "-", ""))
+À vérifier après exécution :
+• Quelques lignes de 2024w1005 donnent bien 20100118 et non 20100117 : une conversion de timestamp peut décaler d'un jour selon le fuseau horaire de la session (spark.sql.session.timeZone).
+• Le lecteur Hive n'est pas vectorisé : il est plus lent. Sur une grosse table, on peut le réactiver ("true") après la lecture concernée.
+À la source (recommandé)
+• Recharger les 17 partitions concernées avec d_ex_date en string, conformément au schéma de la table.
+• Comprendre comment 2024w1005 a été alimentée après le changement de type, pour éviter qu'une ancienne version du traitement ne réécrive en INT96.
+• Une fois les partitions rechargées, retirer le contournement de la recette.
+Quel correctif choisir
+Situation
+Correctif
+La colonne n'est pas utilisée en aval
+L'exclure de la lecture (df.drop("col") ou liste de colonnes) : Parquet ne la lit plus
+La colonne est utile, besoin de débloquer vite
+Lecteur Hive + normalisation (ci-dessus)
+Peu de partitions touchées, lecteur Hive trop lent
+Lire ces partitions par spark.read.parquet et caster, puis unionByName avec les autres
+Dans tous les cas
+Signaler au propriétaire de la table pour une correction à la source
+Options à éviter : augmenter les ressources ou relancer le job (l'erreur ne dépend pas de la taille), et ALTER TABLE sur le type (aucun fichier n'est réécrit).
+6. Bonnes pratiques
+Le métastore décrit ce que la table devrait contenir ; seuls les fichiers disent ce qu'elle contient. Les règles ci-dessous évitent qu'un écart passe inaperçu.
+Pour qui lit une table
+• Ne pas lire SELECT * par défaut : lister les colonnes utiles. Une colonne non lue ne peut pas faire échouer le job.
+• Caster explicitement les colonnes clés (dates, identifiants, montants) juste après la lecture, au lieu de faire confiance au type annoncé.
+• Contrôler le format des dates après lecture, par exemple compter les valeurs qui ne respectent pas yyyyMMdd.
+• Lire le log jusqu'à la ligne Caused by avant de modifier quoi que ce soit.
+Pour qui alimente une table
+• Un changement de type d'une colonne s'accompagne de la réécriture de toutes les partitions existantes, pas seulement d'un ALTER TABLE.
+• Retirer ou bloquer l'ancienne version du traitement de chargement, pour qu'un rechargement ne réintroduise pas l'ancien type.
+• Documenter le changement (date, colonne, ancien et nouveau type) là où les utilisateurs de la table le trouveront.
+Checklist de diagnostic
+[ ] Le log complet est lu jusqu'à Caused by : colonne, type attendu, type trouvé, fichier.
+[ ] Le schéma du métastore est comparé à celui du fichier (spark.read.parquet(...).dtypes).
+[ ] Toutes les partitions sont balayées, pas seulement celle du message d'erreur.
+[ ] Les résultats sont triés dans le temps : rupture nette ou types qui alternent ?
+[ ] La colonne est-elle utilisée en aval ? Le correctif est choisi en conséquence.
+[ ] Après correction, le format des valeurs est vérifié sur une partition touchée et une partition saine.
+[ ] Le propriétaire de la table est informé, avec la liste des partitions.
+Annexes
+Partitions avec d_ex_date en timestamp (17 sur 31)
+Période
+Partitions
+Avant le changement de type
+2023w0819, 2023w1007, 2023w1014, 2023w1104, 2023w1202, 2024w0106, 2024w0224, 2024w0302, 2024w0309, 2024w0330, 2024w0406, 2024w0420, 2024w0511, 2024w0601, 2024w0608, 2024w0706
+Après le changement (exception)
+2024w1005
+Toutes les partitions à partir de 2024w0803 sont en string, sauf 2024w1005.
+Glossaire
